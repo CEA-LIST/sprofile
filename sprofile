@@ -1,0 +1,226 @@
+#!/usr/bin/env sh
+
+# (C) Copyright 2022 CEA LIST. All Rights Reserved.
+# Contributor(s): Nicolas Granger <nicolas.granger@cea.fr>
+#
+# This software is governed by the CeCILL-C license under French law and
+# abiding by the rules of distribution of free software.  You can  use,
+# modify and/ or redistribute the software under the terms of the CeCILL-C
+# license as circulated by CEA, CNRS and INRIA at the following URL
+# "http://www.cecill.info".
+# As a counterpart to the access to the source code and  rights to copy,
+# modify and redistribute granted by the license, users are provided only
+# with a limited warranty  and the software's author,  the holder of the
+# economic rights,  and the successive licensors  have only  limited
+# liability.
+# The fact that you are presently reading this means that you have had
+# knowledge of the CeCILL-C license and that you accept its terms.
+
+cachedir="$HOME/.cache/sprofile/${SLURM_JOB_ID}"
+cg_cpuset="$(grep "cpuset" /proc/self/cgroup | cut -d':' -f3)"
+cg_memory="/slurm/uid_$(id -u)/job_${SLURM_JOB_ID}"
+cg_cpuacct="$(grep "cpuacct" /proc/self/cgroup | cut -d':' -f3)"
+
+export LC_ALL="C"
+
+
+function usage {
+	cat <<-EOF
+	"Usage: add the following lines to the top of your slurm script:
+
+	  srun --ntasks-per-node=1 $0 start
+	  trap "srun --ntasks-per-node=1 $0 stop" EXIT
+
+	Note: make sure the pynvml package is installed in the active python
+	environment when using GPUs.
+	EOF
+}
+
+
+function semaphore {
+	rm -f "${cachedir}/semaphore_end"
+
+	hostname >> "${cachedir}/semaphore_start"
+	tail --follow --lines=+1 "${cachedir}/semaphore_start" | head -n $1 > /dev/null
+	rm -f "${cachedir}/semaphore_start"
+
+	hostname >> "${cachedir}/semaphore_end"
+	tail --follow --lines=+1 "${cachedir}/semaphore_end" | head -n $1 > /dev/null
+}
+
+
+function cpu_load {
+	cg_cpus=$( \
+		cat "/sys/fs/cgroup/cpuset/${cg_cpuset}/cpuset.cpus" \
+		| gawk '{ nf = split($0, a, /[\-,]/, seps); for (i = 1; i < nf + 1; ++i) printf "%d%s", a[i] + 1, seps[i]; }' \
+		)
+	cut -d " " -f "${cg_cpus}" "/sys/fs/cgroup/cpuacct/${cg_cpuacct}/cpuacct.usage_percpu" \
+		| tr ' ' '\n' \
+		> "${cachedir}/cpu_usage_post.${SLURM_NODEID}"
+	avg_cpu_time=$(
+		paste "${cachedir}/cpu_usage_pre.${SLURM_NODEID}" "${cachedir}/cpu_usage_post.${SLURM_NODEID}" \
+		| awk -M '{ sum+=$2-$1; count+=1; } END { print sum / count; }')
+	elapsed=$(paste "${cachedir}/uptime_pre.${SLURM_NODEID}" /proc/uptime | awk -M '{ print ($3 - $1) * 1e9; }')
+	load=$(echo ${avg_cpu_time} ${elapsed} | awk -M '{ printf "%3.0f", $1 * 100 / $2; }')
+
+	printf "  avg CPU:      %3.0f%%\n" $load
+}
+
+
+function peak_ram {
+	peak=$(< "/sys/fs/cgroup/memory/${cg_memory}/memory.max_usage_in_bytes")
+	limit=$(< "/sys/fs/cgroup/memory/${cg_memory}/memory.limit_in_bytes")
+	occupation=$( \
+		echo $peak $limit \
+		| awk -M '{ printf "%3.0f", $1 * 100 / $2; }'\
+		)
+	peak=$(echo $peak | awk -M '{ printf "%3.0f", $1 / (1024 ** 3); }')
+	limit=$(echo $limit | awk -M '{ printf "%3.0f", $1 / (1024 ** 3); }')
+
+	printf "  peak RAM:     %3.0fG / %3.0fG (%3.0f%%)\n" $peak $limit $occupation
+}
+
+
+function gpu_stats {
+	cat <<EOF | python3 -
+import os
+
+import pynvml
+
+
+class Handle:
+	def __init__(self, i):
+		self.i = i
+
+	def __enter__(self):
+		pynvml.nvmlInit()
+		return pynvml.nvmlDeviceGetHandleByIndex(self.i)
+
+	def __exit__(self, type, value, traceback):
+		pynvml.nvmlShutdown()
+
+
+def stats(i, start):
+	with Handle(i) as h:
+		stats = [
+			pynvml.nvmlDeviceGetAccountingStats(h, p)
+			for p in pynvml.nvmlDeviceGetAccountingPids(h)]
+		total_mem = pynvml.nvmlDeviceGetMemoryInfo(h).total
+
+	stats = [s for s in stats if s.startTime // 1e6 >= start]
+
+	timesplits = sorted(
+		[s.startTime for s in stats]
+		+ [s.startTime + s.time for s in stats])
+
+	gpu_time = 0
+	peak_mem = 0
+	for start, stop in zip(timesplits[0:-1], timesplits[1:]):
+		gpu_time_ = 0
+		peak_mem_ = 0
+		for s in stats:
+			if s.startTime <= start and s.startTime + s.time >= stop:
+				gpu_time_ += s.gpuUtilization
+				peak_mem_ += s.maxMemoryUsage
+
+		gpu_time += gpu_time_ * (stop - start)
+		peak_mem = max(peak_mem, peak_mem_)
+
+	if len(timesplits) == 0:
+		gpu_util = 0
+	else:
+		gpu_util = gpu_time / max(timesplits[-1] - timesplits[0], 1)
+
+	return gpu_util, peak_mem, total_mem
+
+
+def main():
+	pynvml.nvmlInit()
+	device_ids = list(range(pynvml.nvmlDeviceGetCount()))
+	pynvml.nvmlShutdown()
+
+	with open(os.path.expanduser(f"~/.cache/sprofile/{os.environ['SLURM_JOB_ID']}/timestamp_pre.{os.environ['SLURM_NODEID']}")) as f:
+		start_time = int(f.read())
+
+	gpu_utils, peak_mems, total_mems = zip(*[stats(i, start_time) for i in device_ids])
+
+	print(f"  avg GPU load: " + " ".join(f"{u:3.0f}%" for u in gpu_utils))
+	print("  peak GPU mem: "
+	      + "   ".join(f"{p / 1024 ** 3:3.0f}G / {t / 1024 ** 3:3.0f}G"
+		               for p, t in zip(peak_mems, total_mems)))
+
+
+if __name__ == "__main__":
+	main()
+EOF
+}
+
+
+function start {
+	mkdir -p ${cachedir}
+
+	cg_cpus=$( \
+		cat "/sys/fs/cgroup/cpuset/${cg_cpuset}/cpuset.cpus" \
+		| gawk '{ nf = split($0, a, /[\-,]/, seps); for (i = 1; i < nf + 1; ++i) printf "%d%s", a[i] + 1, seps[i]; }' \
+		)
+	cut -d " " -f "${cg_cpus}" "/sys/fs/cgroup/cpuacct/${cg_cpuacct}/cpuacct.usage_percpu" \
+		| tr ' ' '\n' \
+		> "${cachedir}/cpu_usage_pre.${SLURM_NODEID}"
+
+	cat /proc/uptime > "${cachedir}/uptime_pre.${SLURM_NODEID}"
+	date -u +%s > "${cachedir}/timestamp_pre.${SLURM_NODEID}"
+}
+
+
+function stop {
+	if [ "${SLURM_LOCALID}" -ne 0 ]; then
+		exit 0
+	fi
+
+	for i in $(seq 0 $(( ${SLURM_JOB_NUM_NODES} - 1 )) ); do
+
+		if [ "$i" -eq "${SLURM_NODEID}" ]; then
+
+			echo ""
+
+			hostname
+
+			cpu_load
+
+			peak_ram
+
+			if [ ! -z "${CUDA_VISIBLE_DEVICES}" ]; then
+
+				gpu_stats
+
+			fi
+
+		fi
+
+		semaphore ${SLURM_JOB_NUM_NODES}
+
+	done
+
+	semaphore ${SLURM_JOB_NUM_NODES}
+	if [ "${SLURM_NODEID}" -eq "0" ]; then
+		rm "${cachedir}" -rf
+	fi
+}
+
+
+case $1 in
+	"start")
+		start
+		;;
+	"stop")
+		stop
+		;;
+	"help")
+		usage $0
+		exit 0
+		;;
+	*)
+		usage $0
+		exit 1
+		;;
+esac
