@@ -17,9 +17,6 @@
 # knowledge of the CeCILL-C license and that you accept its terms.
 
 cachedir="$HOME/.cache/sprofile/${SLURM_JOB_ID}"
-cg_cpuset="$(grep "cpuset" /proc/self/cgroup | cut -d':' -f3)"
-cg_memory="/slurm/uid_$(id -u)/job_${SLURM_JOB_ID}"
-cg_cpuacct="$(grep "cpuacct" /proc/self/cgroup | cut -d':' -f3)"
 
 export LC_ALL="C"
 
@@ -28,11 +25,10 @@ function usage {
 	cat <<-EOF
 	"Usage: add the following lines to the top of your slurm script:
 
-	  srun --ntasks-per-node=1 $0 start
-	  trap "srun --ntasks-per-node=1 $0 stop" EXIT
+	  srun $0 start
+	  trap "srun $0 stop" EXIT
 
-	Note: make sure the pynvml package is installed in the active python
-	environment when using GPUs.
+	Note: make sure the pynvml package is installed when using GPUs.
 	EOF
 }
 
@@ -51,10 +47,10 @@ function semaphore {
 
 function cpu_load {
 	cg_cpus=$( \
-		cat "/sys/fs/cgroup/cpuset/${cg_cpuset}/cpuset.cpus" \
+		cat "/sys/fs/cgroup/cpuset/slurm/uid_$(id -u)/job_${SLURM_JOB_ID}/cpuset.cpus" \
 		| gawk '{ nf = split($0, a, /[\-,]/, seps); for (i = 1; i < nf + 1; ++i) printf "%d%s", a[i] + 1, seps[i]; }' \
 		)
-	cut -d " " -f "${cg_cpus}" "/sys/fs/cgroup/cpuacct/${cg_cpuacct}/cpuacct.usage_percpu" \
+	cut -d " " -f "${cg_cpus}" "/sys/fs/cgroup/cpuacct/cpuacct.usage_percpu" \
 		| tr ' ' '\n' \
 		> "${cachedir}/cpu_usage_post.${SLURM_NODEID}"
 	avg_cpu_time=$(
@@ -68,8 +64,8 @@ function cpu_load {
 
 
 function peak_ram {
-	peak=$(< "/sys/fs/cgroup/memory/${cg_memory}/memory.max_usage_in_bytes")
-	limit=$(< "/sys/fs/cgroup/memory/${cg_memory}/memory.limit_in_bytes")
+	peak=$(< "/sys/fs/cgroup/memory/slurm/uid_$(id -u)/job_${SLURM_JOB_ID}/memory.max_usage_in_bytes")
+	limit=$(< "/sys/fs/cgroup/memory/slurm/uid_$(id -u)/job_${SLURM_JOB_ID}/memory.limit_in_bytes")
 	occupation=$( \
 		echo $peak $limit \
 		| awk -M '{ printf "%3.0f", $1 * 100 / $2; }'\
@@ -82,7 +78,7 @@ function peak_ram {
 
 
 function gpu_stats {
-	cat <<EOF | python3 -
+	cat <<EOF | ${cachedir}/python3 -
 import os
 
 import pynvml
@@ -156,14 +152,30 @@ EOF
 }
 
 
+function duration {
+	elapsed=$(paste "${cachedir}/uptime_pre.${SLURM_NODEID}" /proc/uptime | awk -M '{ print ($3 - $1); }' | awk '{ d = $1 / 86400 ; h = ($1 / 3600) % 24; m = ($1 / 60) % 60; s = $1 % 60; printf "%.0f-%02.0f:%02.0f:%02.0f", d, h, m, s}')
+	reserved=$(scontrol show job $SLURM_JOB_ID -o | sed 's/.*TimeLimit=\([^ ]\+\).*/\1/g')
+	printf "Duration:  %s / %s\n" $elapsed $reserved
+}
+
+
 function start {
+	if [ "${SLURM_LOCALID}" -ne 0 ]; then
+		exit 0
+	fi
+
 	mkdir -p ${cachedir}
 
+	# Save python from current PATH to reuse in stop step
+	if [ "${SLURM_NODEID}" -eq "0" ]; then
+		ln -s $(which python3) ${cachedir}/python3
+	fi
+
 	cg_cpus=$( \
-		cat "/sys/fs/cgroup/cpuset/${cg_cpuset}/cpuset.cpus" \
+		cat "/sys/fs/cgroup/cpuset/slurm/uid_$(id -u)/job_${SLURM_JOB_ID}/cpuset.cpus" \
 		| gawk '{ nf = split($0, a, /[\-,]/, seps); for (i = 1; i < nf + 1; ++i) printf "%d%s", a[i] + 1, seps[i]; }' \
 		)
-	cut -d " " -f "${cg_cpus}" "/sys/fs/cgroup/cpuacct/${cg_cpuacct}/cpuacct.usage_percpu" \
+	cut -d " " -f "${cg_cpus}" "/sys/fs/cgroup/cpuacct/cpuacct.usage_percpu" \
 		| tr ' ' '\n' \
 		> "${cachedir}/cpu_usage_pre.${SLURM_NODEID}"
 
@@ -200,6 +212,9 @@ function stop {
 		semaphore ${SLURM_JOB_NUM_NODES}
 
 	done
+
+	echo ""
+	duration
 
 	semaphore ${SLURM_JOB_NUM_NODES}
 	if [ "${SLURM_NODEID}" -eq "0" ]; then
