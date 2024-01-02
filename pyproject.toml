@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sprofile"
+authors = [{name = "Nicolas Granger", email = "nicolas.granger@cea.fr"}]
+description = "Reporting tool for resources actually consumed by a SLURM job."
+readme = "README.md"
+keywords = ["hpc", "slurm", "profiling", "optimization", "cgroups"]
+license = {"text" = "CECILL-C"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: CeCILL-C Free Software License Agreement (CECILL-C)",
+    "Topic :: System :: Clustering",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "Topic :: System :: Clustering",
+]
+dynamic = ["version"]
+dependencies = ["nvidia-ml-py"]
+
+[project.scripts]
+sprofile = "sprofile:main"
+
+[tool.setuptools.packages.find]
+include = ["sprofile*"]
+
+[tool.setuptools_scm]

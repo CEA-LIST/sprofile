@@ -1,0 +1,1 @@
+from .sprofile import main
