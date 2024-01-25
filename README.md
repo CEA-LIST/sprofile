@@ -29,10 +29,11 @@ srun sprofile stop
 The last command will print actual resource utilization:
 
 ```
--- sprofile report (node03) --
-Time:       0:00:03  /  1:00:00
-CPU load:       2.0  /   4.0
-RAM peak mem:    7G  /    8G
-GPU load:       0.2  /   2.0
-GPU peak mem:    7G  /   40G
+-- sprofile report (node27) --
+  Time:       0:00:25  /  1:00:00
+  CPU load:       0.9  /   2.0
+  RAM peak:        3G  /    8G
+  GPU load:       0.9  /   1.0
+  GPU peak mem:    3G  /   32G
+  GPU energy:     0.0kWh
 ```
