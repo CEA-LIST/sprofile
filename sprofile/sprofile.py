@@ -91,7 +91,7 @@ class TimeStats(Monitor):
         rsv_time = re.search(
             r".*TimeLimit=(([0-9]+)-)?([0-9]+):([0-9]+):([0-9]+).*", job_info
         )
-        _, days, hours, minutes, seconds = map(int, rsv_time.groups(default="0"))
+        days, hours, minutes, seconds = map(int, rsv_time.groups(default="0")[1:])
         rsv_time = timedelta(
             seconds=days * 86400 + hours * 3600 + minutes * 60 + seconds
         )
@@ -99,7 +99,7 @@ class TimeStats(Monitor):
         run_time = re.search(
             r".*RunTime=(([0-9]+)-)?([0-9]+):([0-9]+):([0-9]+).*", job_info
         )
-        _, days, hours, minutes, seconds = map(int, run_time.groups(default="0"))
+        days, hours, minutes, seconds = map(int, run_time.groups(default="0")[1:])
         run_time = timedelta(
             seconds=days * 86400 + hours * 3600 + minutes * 60 + seconds
         )
