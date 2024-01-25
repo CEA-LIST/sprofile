@@ -24,11 +24,17 @@ hostname = socket.gethostname()
 def num_gpus():
     if pynvml is None:
         return 0
+
     try:
         pynvml.nvmlInit()
-        return pynvml.nvmlDeviceGetCount()
-    finally:
-        pynvml.nvmlShutdown()
+    except pynvml.NVMLError:  # No driver or GPU
+        return 0
+
+    c = pynvml.nvmlDeviceGetCount()
+
+    pynvml.nvmlShutdown()
+
+    return c
 
 
 class Semaphore:
