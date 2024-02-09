@@ -240,7 +240,7 @@ class CGroupStats(Monitor):
         run_time = re.search(
             r".*RunTime=(([0-9]+)-)?([0-9]+):([0-9]+):([0-9]+).*", job_info
         )
-        _, days, hours, minutes, seconds = map(int, run_time.groups(default="0"))
+        days, hours, minutes, seconds = map(int, run_time.groups(default="0")[1:])
         run_time = days * 86400 + hours * 3600 + minutes * 60 + seconds
 
         cpu_load = [t / (run_time * 1e9) for t in cpu_times]
