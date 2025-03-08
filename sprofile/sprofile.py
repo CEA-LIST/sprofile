@@ -1,7 +1,6 @@
 import argparse
 import os
 import re
-import socket
 import subprocess
 import time
 from datetime import timedelta
@@ -18,7 +17,7 @@ except ImportError:
 cache_dir = os.environ.get("CACHEDIR", os.path.expanduser("~/.cache"))
 job_id = os.environ["SLURM_JOB_ID"]
 job_info = subprocess.check_output(f"scontrol show job {job_id} -o".split(), text=True)
-hostname = socket.gethostname()
+nodename = os.environ["SLURMD_NODENAME"]
 
 
 def num_gpus():
@@ -198,7 +197,23 @@ class NVMLStats(Monitor):
         )
 
 
-class CGroupStats(Monitor):
+class CGroupV1Stats(Monitor):
+    @staticmethod
+    def cpuset():
+        with open(
+            f"/sys/fs/cgroup/cpuset/slurm/uid_{os.getuid()}/job_{job_id}/cpuset.cpus"
+        ) as f:
+            line = f.read().strip()
+            cpuset = []
+            for c in line.split(","):
+                if "-" in c:
+                    start, stop = map(int, c.split("-"))
+                    cpuset.extend(range(start, stop + 1))
+                else:
+                    cpuset.append(int(c))
+
+        return cpuset
+
     @staticmethod
     def start(db):
         with open("/sys/fs/cgroup/cpuacct/cpuacct.usage_percpu") as f:
@@ -218,24 +233,14 @@ class CGroupStats(Monitor):
         ) as f:
             memory_limit = int(f.read().strip())
 
-        with open(
-            f"/sys/fs/cgroup/cpuset/slurm/uid_{os.getuid()}/job_{job_id}/cpuset.cpus"
-        ) as f:
-            line = f.read().strip()
-            cpuset = []
-            for c in line.split(","):
-                if "-" in c:
-                    start, stop = map(int, c.split("-"))
-                    cpuset.extend(range(start, stop + 1))
-                else:
-                    cpuset.append(int(c))
-
-        with open(f"/sys/fs/cgroup/cpuacct/cpuacct.usage_percpu") as f:
+        with open("/sys/fs/cgroup/cpuacct/cpuacct.usage_percpu") as f:
             usage_percpu = list(map(int, f.read().strip().split()))
 
         usage_percpu_old = db["usage_percpu_old"]
 
-        cpu_times = [usage_percpu[i] - usage_percpu_old[i] for i in cpuset]
+        cpu_times = [
+            usage_percpu[i] - usage_percpu_old[i] for i in CGroupV1Stats.cpuset()
+        ]
 
         run_time = re.search(
             r".*RunTime=(([0-9]+)-)?([0-9]+):([0-9]+):([0-9]+).*", job_info
@@ -253,7 +258,70 @@ class CGroupStats(Monitor):
         )
 
 
+class CGroupV2Stats(Monitor):
+    @staticmethod
+    def cgroup_path():
+        if os.path.exists(
+            f"/sys/fs/cgroup/system.slice/{nodename}_slurmstepd.scope/job_{job_id}"
+        ):
+            return (
+                f"/sys/fs/cgroup/system.slice/{nodename}_slurmstepd.scope/job_{job_id}"
+            )
+        else:
+            return f"/sys/fs/cgroup/system.slice/slurmstepd.scope/job_{job_id}"
+
+    @staticmethod
+    def cpuset():
+        with open(CGroupV2Stats.cgroup_path() + "/cpuset.cpus") as f:
+            line = f.read().strip()
+            cpuset = []
+            for c in line.split(","):
+                if "-" in c:
+                    start, stop = map(int, c.split("-"))
+                    cpuset.extend(range(start, stop + 1))
+                else:
+                    cpuset.append(int(c))
+
+        return cpuset
+
+    @staticmethod
+    def start(db):
+        pass
+
+    @staticmethod
+    def stop(db):
+        with open(CGroupV2Stats.cgroup_path() + "/memory.peak") as f:
+            memory_max = int(f.read().strip())
+
+        with open(CGroupV2Stats.cgroup_path() + "/memory.max") as f:
+            memory_limit = int(f.read().strip())
+
+        with open(CGroupV2Stats.cgroup_path() + "/cpu.stat") as f:
+            cpustat = dict(x.split(" ") for x in f.readlines())
+            cpu_time = int(cpustat["usage_usec"]) / 1e6
+
+        run_time = re.search(
+            r".*RunTime=(([0-9]+)-)?([0-9]+):([0-9]+):([0-9]+).*", job_info
+        )
+        days, hours, minutes, seconds = map(int, run_time.groups(default="0")[1:])
+        run_time = days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+        cpu_load = cpu_time / run_time
+
+        return (
+            cpu_load,
+            len(CGroupV2Stats.cpuset()),
+            memory_max / 1024**3,
+            memory_limit / 1024**3,
+        )
+
+
 def main():
+    if os.path.exists("/sys/fs/cgroup/cpuacct/cpuacct.usage_percpu"):
+        CGroupStats = CGroupV1Stats
+    else:
+        CGroupStats = CGroupV2Stats
+
     if os.environ["SLURM_LOCALID"] != "0":
         return
 
@@ -263,7 +331,7 @@ def main():
 
     os.makedirs(cache_dir, exist_ok=True)
 
-    with shelve.open(f"{cache_dir}/sprofile.{job_id}.{hostname}") as db:
+    with shelve.open(f"{cache_dir}/sprofile.{job_id}.{nodename}") as db:
         if args.action == "start":
             TimeStats.start(db)
             CGroupStats.start(db)
@@ -272,7 +340,7 @@ def main():
 
         elif args.action == "stop":
             with Semaphore(f"{cache_dir}/sprofile.{job_id}.lock"):
-                print(f"-- sprofile report ({hostname}) --")
+                print(f"-- sprofile report ({nodename}) --")
 
                 run_time, rsv_time = TimeStats.stop(db)
                 print(f"  Time:  {str(run_time):>12s}  /  {str(rsv_time):s}")
